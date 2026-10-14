@@ -1,7 +1,13 @@
 #define WIN32_LEAN_AND_MEAN
+#ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0502 // Windows XP 64-bit (NT 5.2) compatibility target
+#endif
+#ifndef UNICODE
 #define UNICODE
+#endif
+#ifndef _UNICODE
 #define _UNICODE
+#endif
 
 /*
 ================================================================================
@@ -9,20 +15,24 @@
 ================================================================================
   Features:
   - Portable single-executable: zero dependencies, zero installer.
-  - Dual-Graph DirectShow Architecture for seamless video & audio crossfading.
-  - Perceptual logarithmic audio fade-out on pause and fade-in on resume.
+  - Media Foundation playback on Windows 7+ so MP4/H.264/AAC plays without a codec pack.
+  - DirectShow fallback for older systems and formats MF cannot open.
+  - Dual-stream video and audio crossfade between playlist items.
+  - Perceptual logarithmic audio fade-out on pause and fade-in on resume (DirectShow).
+  - Linear audio fades when Media Foundation is driving playback.
   - Configurable crossfade time and pause/resume fade duration via Settings.
   - Drag-and-drop playlist management (reordering, removal, clearing).
-  - Open and Save M3U playlists.
+  - Open and Save M3U playlists. Optional file paths on the command line.
   - Full keyboard shortcuts: Spacebar to toggle Play/Pause, Esc, etc.
   - Win32 UI compatible across WinXP x64, Vista, 7, 8, 8.1, 10, and 11.
 
-  Compilation (MinGW-w64 on 64-bit Windows):
-    x86_64-w64-mingw32-g++ -O2 -municode -mwindows main.cpp -o CrossFadePlayer.exe \
-      -lstrmiids -lole32 -loleaut32 -lcomctl32 -lcomdlg32 -lshell32 -lshlwapi -lgdi32
+  Compilation (MinGW-w64):
+    x86_64-w64-mingw32-g++ -O2 -std=c++17 -municode -mwindows -static crossfade_player.cpp \
+      -o CrossFadePlayer.exe -lstrmiids -lole32 -loleaut32 -lcomctl32 -lcomdlg32 \
+      -lshell32 -lshlwapi -lgdi32 -luser32 -luuid
 
   Compilation (Visual Studio x64 Native Tools Command Prompt):
-    cl /O2 /DUNICODE /D_UNICODE main.cpp /Fe:CrossFadePlayer.exe \
+    cl /O2 /std:c++17 /DUNICODE /D_UNICODE crossfade_player.cpp /Fe:CrossFadePlayer.exe \
       /link /SUBSYSTEM:WINDOWS,5.02 /MACHINE:X64 strmiids.lib ole32.lib \
       oleaut32.lib comctl32.lib comdlg32.lib shell32.lib shlwapi.lib gdi32.lib user32.lib
 ================================================================================
@@ -34,6 +44,20 @@
 #include <shellapi.h>
 #include <shlwapi.h>
 #include <dshow.h>
+
+// Media Foundation headers are Win7+. Raise the version only for these includes
+// so the rest of the binary still loads on older Windows and falls back to DirectShow.
+#pragma push_macro("_WIN32_WINNT")
+#pragma push_macro("WINVER")
+#undef _WIN32_WINNT
+#undef WINVER
+#define _WIN32_WINNT 0x0601
+#define WINVER 0x0601
+#include <mfapi.h>
+#include <mfplay.h>
+#pragma pop_macro("WINVER")
+#pragma pop_macro("_WIN32_WINNT")
+
 #include <cmath>
 #include <vector>
 #include <string>
@@ -52,6 +76,7 @@
 #pragma comment(lib, "user32.lib")
 
 #define WM_DS_EVENT           (WM_APP + 101)
+#define WM_PLAYBACK_ENDED     (WM_APP + 102)
 #define TIMER_ENGINE_TICK     1001
 
 #define IDC_BTN_PLAY          2001
@@ -119,6 +144,40 @@ static std::wstring FormatTimeSeconds(double totalSeconds) {
     return std::wstring(buf);
 }
 
+class DirectShowStream;
+
+class MFPlayerCallback : public IMFPMediaPlayerCallback {
+public:
+    DirectShowStream* owner;
+    LONG refCount;
+
+    explicit MFPlayerCallback(DirectShowStream* streamOwner)
+        : owner(streamOwner), refCount(1) {}
+
+    STDMETHODIMP QueryInterface(REFIID riid, void** ppv) {
+        if (!ppv) return E_POINTER;
+        if (riid == IID_IUnknown || riid == __uuidof(IMFPMediaPlayerCallback)) {
+            *ppv = static_cast<IMFPMediaPlayerCallback*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = NULL;
+        return E_NOINTERFACE;
+    }
+
+    STDMETHODIMP_(ULONG) AddRef() {
+        return InterlockedIncrement(&refCount);
+    }
+
+    STDMETHODIMP_(ULONG) Release() {
+        ULONG count = InterlockedDecrement(&refCount);
+        if (count == 0) delete this;
+        return count;
+    }
+
+    void STDMETHODCALLTYPE OnMediaPlayerEvent(MFP_EVENT_HEADER* header);
+};
+
 class DirectShowStream {
 public:
     IGraphBuilder*   pGraph;
@@ -126,20 +185,45 @@ public:
     IMediaSeeking*   pSeeking;
     IBasicAudio*     pAudio;
     IVideoWindow*    pVideo;
+    IMFPMediaPlayer* pMF;
+    MFPlayerCallback* pMFCallback;
     HWND             hContainerWnd;
+    HWND             hNotifyWnd;
     std::wstring     currentFilePath;
     bool             isInitialized;
     bool             hasVideo;
+    bool             useMF;
+    HRESULT          lastError;
 
     DirectShowStream() 
         : pGraph(NULL), pControl(NULL), pSeeking(NULL), pAudio(NULL), 
-          pVideo(NULL), hContainerWnd(NULL), isInitialized(false), hasVideo(false) {}
+          pVideo(NULL), pMF(NULL), pMFCallback(NULL), hContainerWnd(NULL),
+          hNotifyWnd(NULL), isInitialized(false), hasVideo(false), useMF(false),
+          lastError(S_OK) {}
 
     ~DirectShowStream() {
         Release();
     }
 
+    void NotifyPlaybackEnded() {
+        if (hNotifyWnd) {
+            PostMessage(hNotifyWnd, WM_PLAYBACK_ENDED, 0, (LPARAM)this);
+        }
+    }
+
     void Release() {
+        if (pMFCallback) pMFCallback->owner = NULL;
+        if (pMF) {
+            pMF->Shutdown();
+            pMF->Release();
+            pMF = NULL;
+        }
+        if (pMFCallback) {
+            pMFCallback->Release();
+            pMFCallback = NULL;
+        }
+        useMF = false;
+
         if (pControl) {
             pControl->Stop();
         }
@@ -159,9 +243,92 @@ public:
         currentFilePath.clear();
     }
 
-    bool Load(const std::wstring& filePath, HWND hWndTarget, HWND hNotifyWnd) {
+    bool TryLoadMediaFoundation(const std::wstring& filePath, HWND hWndTarget, HWND notifyWnd) {
+        typedef HRESULT (WINAPI *PFN_MFPCreate)(
+            LPCWSTR, BOOL, MFP_CREATION_OPTIONS, IMFPMediaPlayerCallback*, HWND, IMFPMediaPlayer**);
+        typedef HRESULT (WINAPI *PFN_MFStartup)(ULONG, DWORD);
+
+        static PFN_MFPCreate pfnCreate = NULL;
+        static bool resolved = false;
+        if (!resolved) {
+            resolved = true;
+            HMODULE hPlat = LoadLibraryW(L"mfplat.dll");
+            HMODULE hPlay = LoadLibraryW(L"mfplay.dll");
+            if (hPlat && hPlay) {
+                PFN_MFStartup pfnStartup = (PFN_MFStartup)GetProcAddress(hPlat, "MFStartup");
+                if (pfnStartup) {
+                    pfnStartup(MF_VERSION, MFSTARTUP_FULL);
+                }
+                pfnCreate = (PFN_MFPCreate)GetProcAddress(hPlay, "MFPCreateMediaPlayer");
+            }
+        }
+        if (!pfnCreate) {
+            lastError = HRESULT_FROM_WIN32(ERROR_MOD_NOT_FOUND);
+            return false;
+        }
+
+        MFPlayerCallback* callback = new MFPlayerCallback(this);
+        IMFPMediaPlayer* player = NULL;
+        HRESULT hr = pfnCreate(NULL, FALSE, MFP_OPTION_NONE, callback, hWndTarget, &player);
+        if (FAILED(hr) || !player) {
+            lastError = FAILED(hr) ? hr : E_FAIL;
+            callback->owner = NULL;
+            callback->Release();
+            return false;
+        }
+
+        IMFPMediaItem* item = NULL;
+        hr = player->CreateMediaItemFromURL(filePath.c_str(), TRUE, 0, &item);
+        if (FAILED(hr) || !item) {
+            lastError = FAILED(hr) ? hr : E_FAIL;
+            callback->owner = NULL;
+            player->Shutdown();
+            player->Release();
+            callback->Release();
+            return false;
+        }
+
+        hr = player->SetMediaItem(item);
+        item->Release();
+        if (FAILED(hr)) {
+            lastError = hr;
+            callback->owner = NULL;
+            player->Shutdown();
+            player->Release();
+            callback->Release();
+            return false;
+        }
+
+        pMF = player;
+        pMFCallback = callback;
+        useMF = true;
+        hContainerWnd = hWndTarget;
+        hNotifyWnd = notifyWnd;
+        currentFilePath = filePath;
+        isInitialized = true;
+        lastError = S_OK;
+
+        SIZE nativeSize = { 0, 0 };
+        if (SUCCEEDED(player->GetNativeVideoSize(&nativeSize, NULL)) && nativeSize.cx > 0 && nativeSize.cy > 0) {
+            hasVideo = true;
+        }
+        player->SetAspectRatioMode(MFVideoARMode_PreservePicture);
+        player->SetBorderColor(RGB(0, 0, 0));
+        player->UpdateVideo();
+        return true;
+    }
+
+    bool Load(const std::wstring& filePath, HWND hWndTarget, HWND notifyWnd) {
         Release();
         hContainerWnd = hWndTarget;
+        hNotifyWnd = notifyWnd;
+        lastError = S_OK;
+
+        if (TryLoadMediaFoundation(filePath, hWndTarget, notifyWnd)) {
+            return true;
+        }
+
+        HRESULT mfError = lastError;
 
         HRESULT hr = CoCreateInstance(CLSID_FilterGraph, NULL, CLSCTX_INPROC_SERVER,
                                       IID_IGraphBuilder, (void**)&pGraph);
@@ -174,14 +341,16 @@ public:
 
         hr = pGraph->RenderFile(filePath.c_str(), NULL);
         if (FAILED(hr)) {
+            lastError = FAILED(mfError) ? mfError : hr;
             Release();
+            lastError = FAILED(mfError) ? mfError : hr;
             return false;
         }
 
         // Setup notification routing
         IMediaEventEx* pEvent = NULL;
         if (SUCCEEDED(pGraph->QueryInterface(IID_IMediaEventEx, (void**)&pEvent)) && pEvent) {
-            pEvent->SetNotifyWindow((OAHWND)hNotifyWnd, WM_DS_EVENT, (LONG_PTR)this);
+            pEvent->SetNotifyWindow((OAHWND)notifyWnd, WM_DS_EVENT, (LONG_PTR)this);
             pEvent->Release();
         }
 
@@ -192,7 +361,7 @@ public:
                 hasVideo = true;
                 pVideo->put_Owner((OAHWND)hContainerWnd);
                 pVideo->put_WindowStyle(WS_CHILD | WS_CLIPSIBLINGS | WS_CLIPCHILDREN);
-                pVideo->put_MessageDrain((OAHWND)hNotifyWnd);
+                pVideo->put_MessageDrain((OAHWND)notifyWnd);
                 ResizeToWindow();
                 pVideo->put_Visible(OATRUE);
             }
@@ -203,7 +372,20 @@ public:
         return true;
     }
 
+    void RefreshVideo() {
+        // MFPlay does not keep painting on its own. UpdateVideo blits the
+        // current frame; without it the window stays on the first picture
+        // while the clock keeps advancing.
+        if (useMF && pMF && hasVideo) {
+            pMF->UpdateVideo();
+        }
+    }
+
     void ResizeToWindow() {
+        if (useMF && pMF) {
+            pMF->UpdateVideo();
+            return;
+        }
         if (pVideo && hContainerWnd) {
             RECT rc;
             GetClientRect(hContainerWnd, &rc);
@@ -212,14 +394,27 @@ public:
     }
 
     void Play() {
+        if (useMF && pMF) {
+            pMF->Play();
+            return;
+        }
         if (pControl) pControl->Run();
     }
 
     void Pause() {
+        if (useMF && pMF) {
+            pMF->Pause();
+            return;
+        }
         if (pControl) pControl->Pause();
     }
 
     void Stop() {
+        if (useMF && pMF) {
+            pMF->Stop();
+            SetPosition(0.0);
+            return;
+        }
         if (pControl) {
             pControl->Stop();
             LONGLONG pos = 0;
@@ -230,12 +425,34 @@ public:
     }
 
     void SetVolume(double volumeFactor) {
+        if (volumeFactor < 0.0) volumeFactor = 0.0;
+        if (volumeFactor > 1.0) volumeFactor = 1.0;
+        if (useMF && pMF) {
+            pMF->SetVolume((float)volumeFactor);
+            return;
+        }
         if (pAudio) {
             pAudio->put_Volume(LinearToDirectShowVolume(volumeFactor));
         }
     }
 
+    static double HundredNsToSeconds(const PROPVARIANT& value) {
+        if (value.vt == VT_I8) return (double)value.hVal.QuadPart / 10000000.0;
+        if (value.vt == VT_UI8) return (double)value.uhVal.QuadPart / 10000000.0;
+        return 0.0;
+    }
+
     double GetDuration() {
+        if (useMF && pMF) {
+            PROPVARIANT value;
+            PropVariantInit(&value);
+            double seconds = 0.0;
+            if (SUCCEEDED(pMF->GetDuration(MFP_POSITIONTYPE_100NS, &value))) {
+                seconds = HundredNsToSeconds(value);
+            }
+            PropVariantClear(&value);
+            return seconds;
+        }
         if (!pSeeking) return 0.0;
         LONGLONG duration = 0;
         if (SUCCEEDED(pSeeking->GetDuration(&duration))) {
@@ -245,6 +462,16 @@ public:
     }
 
     double GetPosition() {
+        if (useMF && pMF) {
+            PROPVARIANT value;
+            PropVariantInit(&value);
+            double seconds = 0.0;
+            if (SUCCEEDED(pMF->GetPosition(MFP_POSITIONTYPE_100NS, &value))) {
+                seconds = HundredNsToSeconds(value);
+            }
+            PropVariantClear(&value);
+            return seconds;
+        }
         if (!pSeeking) return 0.0;
         LONGLONG curPos = 0;
         if (SUCCEEDED(pSeeking->GetCurrentPosition(&curPos))) {
@@ -254,11 +481,32 @@ public:
     }
 
     void SetPosition(double seconds) {
+        if (seconds < 0.0) seconds = 0.0;
+        if (useMF && pMF) {
+            PROPVARIANT value;
+            PropVariantInit(&value);
+            value.vt = VT_I8;
+            value.hVal.QuadPart = (LONGLONG)(seconds * 10000000.0);
+            pMF->SetPosition(MFP_POSITIONTYPE_100NS, &value);
+            PropVariantClear(&value);
+            return;
+        }
         if (!pSeeking) return;
         LONGLONG pos = (LONGLONG)(seconds * 10000000.0);
         pSeeking->SetPositions(&pos, AM_SEEKING_AbsolutePositioning, NULL, AM_SEEKING_NoPositioning);
     }
 };
+
+void STDMETHODCALLTYPE MFPlayerCallback::OnMediaPlayerEvent(MFP_EVENT_HEADER* header) {
+    if (!header || !owner) return;
+    if (header->eEventType == MFP_EVENT_TYPE_PLAYBACK_ENDED) {
+        owner->NotifyPlaybackEnded();
+    } else if (header->eEventType == MFP_EVENT_TYPE_ERROR) {
+        owner->lastError = header->hrEvent;
+    }
+}
+
+static LRESULT CALLBACK VideoHostProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 class VideoPlayerApp {
 public:
@@ -337,10 +585,17 @@ public:
     void CreateControls(HWND hWndParent, HINSTANCE hInstance) {
         m_hWndMain = hWndParent;
 
-        // Custom base viewport container for primary video
+        // Dedicated viewport. A STATIC black rect paints over Media Foundation video.
+        WNDCLASS wcHost = { 0 };
+        wcHost.lpfnWndProc = VideoHostProc;
+        wcHost.hInstance = hInstance;
+        wcHost.lpszClassName = L"CrossfadeVideoHost";
+        wcHost.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
+        RegisterClass(&wcHost);
+
         m_hWndVideoBase = CreateWindowEx(
-            0, L"STATIC", L"",
-            WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | SS_BLACKRECT,
+            0, L"CrossfadeVideoHost", L"",
+            WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
             10, 10, 640, 360,
             hWndParent, NULL, hInstance, NULL
         );
@@ -644,7 +899,10 @@ public:
             SetStatusText(L"Playing: " + std::wstring(PathFindFileName(m_playlistFiles[index].c_str())));
             UpdateSyncOverlayPosition();
         } else {
-            SetStatusText(L"Error: Could not render media file.");
+            wchar_t errBuf[160];
+            swprintf(errBuf, 160, L"Error: Could not render media file (%08X).",
+                     (unsigned)pActive->lastError);
+            SetStatusText(errBuf);
             m_state = STATE_STOPPED;
         }
     }
@@ -818,6 +1076,12 @@ public:
             }
         }
 
+        if (m_state == STATE_PLAYING || m_state == STATE_FADING_TO_PAUSE ||
+            m_state == STATE_FADING_FROM_PAUSE || m_state == STATE_PAUSED || m_isCrossfading) {
+            m_streamA.RefreshVideo();
+            m_streamB.RefreshVideo();
+        }
+
         // 4. Update crossfade progression
         if (m_isCrossfading) {
             m_crossfadeTimer += deltaTime;
@@ -843,6 +1107,30 @@ public:
 };
 
 static VideoPlayerApp* g_pApp = NULL;
+
+static LRESULT CALLBACK VideoHostProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        BeginPaint(hWnd, &ps);
+        EndPaint(hWnd, &ps);
+        // UpdateVideo can itself generate WM_PAINT. Guard against re-entry.
+        static int refreshing = 0;
+        if (g_pApp && !refreshing) {
+            refreshing++;
+            g_pApp->m_streamA.RefreshVideo();
+            g_pApp->m_streamB.RefreshVideo();
+            refreshing--;
+        }
+        return 0;
+    }
+    default:
+        break;
+    }
+    return DefWindowProc(hWnd, msg, wParam, lParam);
+}
 
 INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
@@ -952,7 +1240,7 @@ void ShowSettingsDialog(HWND hWndParent, HINSTANCE hInstance) {
         if (msg.message == WM_COMMAND) {
             if (LOWORD(msg.wParam) == IDOK) {
                 GetWindowText(hEd1, b1, 32);
-                GetWindowText(hEd2, b2);
+                GetWindowText(hEd2, b2, 32);
                 double cf = _wtof(b1);
                 double fp = _wtof(b2);
                 if (cf >= 0.5 && cf <= 30.0) g_pApp->m_settings.crossfadeDuration = cf;
@@ -1001,7 +1289,7 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         HWND hScroll = (HWND)lParam;
         if (hScroll == g_pApp->m_hSeekBar) {
             int request = LOWORD(wParam);
-            if (request == TB_THUMBTRACK || request == TB_TRACKSEEK) {
+            if (request == TB_THUMBTRACK || request == TB_THUMBPOSITION) {
                 g_pApp->m_userIsDraggingSeek = true;
             } else if (request == TB_ENDTRACK) {
                 g_pApp->m_userIsDraggingSeek = false;
@@ -1083,6 +1371,14 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         return 0;
     }
 
+    case WM_PLAYBACK_ENDED: {
+        DirectShowStream* pEnded = (DirectShowStream*)lParam;
+        if (g_pApp && pEnded == g_pApp->GetActiveStream() && !g_pApp->m_isCrossfading) {
+            g_pApp->NextTrack();
+        }
+        return 0;
+    }
+
     case WM_DS_EVENT: {
         // DirectShow Media Event notification
         DirectShowStream* pStream = (DirectShowStream*)lParam;
@@ -1154,6 +1450,20 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
 
     ShowWindow(hWnd, nCmdShow);
     UpdateWindow(hWnd);
+
+    int argCount = 0;
+    LPWSTR* argList = CommandLineToArgvW(GetCommandLineW(), &argCount);
+    if (argList) {
+        for (int i = 1; i < argCount; ++i) {
+            if (argList[i] && argList[i][0] != L'\0') {
+                g_pApp->AddFileToPlaylist(argList[i]);
+            }
+        }
+        LocalFree(argList);
+        if (!g_pApp->m_playlistFiles.empty()) {
+            g_pApp->PlayTrackIndex(0);
+        }
+    }
 
     // High frequency clock tick timer for smooth 60fps crossfade and audio ramping
     SetTimer(hWnd, TIMER_ENGINE_TICK, 16, NULL);
