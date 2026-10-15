@@ -21,6 +21,7 @@
   - Perceptual logarithmic audio fade-out on pause and fade-in on resume (DirectShow).
   - Linear audio fades when Media Foundation is driving playback.
   - Configurable crossfade time and pause/resume fade duration via Settings.
+  - Settings are stored in settings.json beside the executable.
   - Drag-and-drop playlist management (reordering, removal, clearing).
   - Open and Save M3U playlists. Optional file paths on the command line.
   - Fullscreen the video display only (not the rest of the window): Fullscreen button,
@@ -61,6 +62,7 @@
 #pragma pop_macro("_WIN32_WINNT")
 
 #include <cmath>
+#include <cstdio>
 #include <vector>
 #include <string>
 #include <sstream>
@@ -147,6 +149,138 @@ static std::wstring FormatTimeSeconds(double totalSeconds) {
     return std::wstring(buf);
 }
 
+// settings.json lives next to the executable (dev build and the launched copy).
+static std::wstring SettingsFilePath() {
+    wchar_t modulePath[32768];
+    DWORD len = GetModuleFileNameW(NULL, modulePath, 32768);
+    if (len == 0 || len >= 32767) {
+        return L"settings.json";
+    }
+    wchar_t* slash = wcsrchr(modulePath, L'\\');
+    if (!slash) {
+        return L"settings.json";
+    }
+    *(slash + 1) = L'\0';
+    std::wstring path = modulePath;
+    path += L"settings.json";
+    return path;
+}
+
+static bool ParseJsonNumber(const char* text, const char** endOut, double* out) {
+    const char* s = text;
+    while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n') s++;
+    int sign = 1;
+    if (*s == '-') {
+        sign = -1;
+        s++;
+    } else if (*s == '+') {
+        s++;
+    }
+    bool any = false;
+    double value = 0.0;
+    while (*s >= '0' && *s <= '9') {
+        any = true;
+        value = value * 10.0 + (double)(*s - '0');
+        s++;
+    }
+    if (*s == '.') {
+        s++;
+        double place = 0.1;
+        while (*s >= '0' && *s <= '9') {
+            any = true;
+            value += (double)(*s - '0') * place;
+            place *= 0.1;
+            s++;
+        }
+    }
+    if (!any) return false;
+    *out = value * (double)sign;
+    if (endOut) *endOut = s;
+    return true;
+}
+
+static bool ExtractJsonNumber(const std::string& text, const char* key, double* out) {
+    std::string pattern = std::string("\"") + key + "\"";
+    size_t pos = text.find(pattern);
+    if (pos == std::string::npos) return false;
+    pos = text.find(':', pos + pattern.size());
+    if (pos == std::string::npos) return false;
+    const char* end = NULL;
+    if (!ParseJsonNumber(text.c_str() + pos + 1, &end, out)) return false;
+    return true;
+}
+
+// Missing or unreadable files return false. Invalid contents also return false
+// so the caller keeps the in-memory defaults instead of half-applying garbage.
+static bool ReadSettingsJson(const std::wstring& path, PlayerSettings* out) {
+    if (!out) return false;
+    FILE* file = _wfopen(path.c_str(), L"rb");
+    if (!file) return false;
+    char buf[4096];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, file);
+    int err = ferror(file);
+    fclose(file);
+    if (err || n == 0 || n >= sizeof(buf) - 1) return false;
+    size_t start = 0;
+    if (n >= 3 && (unsigned char)buf[0] == 0xEF && (unsigned char)buf[1] == 0xBB && (unsigned char)buf[2] == 0xBF) {
+        start = 3;
+    }
+    buf[n] = '\0';
+    std::string text(buf + start);
+    double crossfade = 0.0, pauseFade = 0.0, volume = 0.0;
+    if (!ExtractJsonNumber(text, "crossfadeDuration", &crossfade)) return false;
+    if (!ExtractJsonNumber(text, "pauseFadeDuration", &pauseFade)) return false;
+    if (!ExtractJsonNumber(text, "masterVolume", &volume)) return false;
+    if (crossfade < 0.5 - 1e-6 || crossfade > 30.0 + 1e-6) return false;
+    if (pauseFade < 0.1 - 1e-6 || pauseFade > 10.0 + 1e-6) return false;
+    if (volume < -1e-6 || volume > 100.0 + 1e-6) return false;
+    int volInt = (int)(volume + (volume >= 0 ? 0.5 : -0.5));
+    if (volInt < 0 || volInt > 100) return false;
+    out->crossfadeDuration = crossfade;
+    out->pauseFadeDuration = pauseFade;
+    out->masterVolume = volInt;
+    return true;
+}
+
+static bool WriteSettingsJson(const std::wstring& path, const PlayerSettings& settings) {
+    std::wstring tmp = path + L".tmp";
+    FILE* file = _wfopen(tmp.c_str(), L"wb");
+    if (!file) return false;
+    int wrote = fprintf(file,
+        "{\n"
+        "  \"crossfadeDuration\": %.3f,\n"
+        "  \"pauseFadeDuration\": %.3f,\n"
+        "  \"masterVolume\": %d\n"
+        "}\n",
+        settings.crossfadeDuration,
+        settings.pauseFadeDuration,
+        settings.masterVolume);
+    if (fflush(file) != 0) wrote = -1;
+    fclose(file);
+    if (wrote < 0) {
+        DeleteFileW(tmp.c_str());
+        return false;
+    }
+    if (!MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileW(path.c_str());
+        if (!MoveFileW(tmp.c_str(), path.c_str())) {
+            DeleteFileW(tmp.c_str());
+            return false;
+        }
+    }
+    return true;
+}
+
+static void PaintWindowBlack(HWND hwnd) {
+    if (!hwnd || !IsWindow(hwnd)) return;
+    RECT rc;
+    GetClientRect(hwnd, &rc);
+    HDC dc = GetDC(hwnd);
+    if (!dc) return;
+    FillRect(dc, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
+    ReleaseDC(hwnd, dc);
+}
+
 class DirectShowStream;
 
 class MFPlayerCallback : public IMFPMediaPlayerCallback {
@@ -215,6 +349,7 @@ public:
     }
 
     void Release() {
+        HWND container = hContainerWnd;
         if (pMFCallback) pMFCallback->owner = NULL;
         if (pMF) {
             pMF->Shutdown();
@@ -244,6 +379,19 @@ public:
         isInitialized = false;
         hasVideo = false;
         currentFilePath.clear();
+        hContainerWnd = NULL;
+
+        // The renderer leaves its last blit (or a child video window) behind.
+        // Drop both so a finished clip cannot stay painted on this surface.
+        if (container && IsWindow(container)) {
+            for (int guard = 0; guard < 32; ++guard) {
+                HWND child = GetWindow(container, GW_CHILD);
+                if (!child) break;
+                if (!DestroyWindow(child)) break;
+            }
+            PaintWindowBlack(container);
+            InvalidateRect(container, NULL, FALSE);
+        }
     }
 
     bool TryLoadMediaFoundation(const std::wstring& filePath, HWND hWndTarget, HWND notifyWnd) {
@@ -575,6 +723,42 @@ public:
         m_settings.crossfadeDuration = 3.0; // Default 3s crossfade
         m_settings.pauseFadeDuration = 1.5; // Default 1.5s audio fade on pause/play
         m_settings.masterVolume = 85;       // 85% volume
+        PlayerSettings loaded;
+        if (ReadSettingsJson(SettingsFilePath(), &loaded)) {
+            m_settings = loaded;
+        }
+    }
+
+    void ApplySettingsToControls() {
+        if (m_hVolBar) {
+            SendMessage(m_hVolBar, TBM_SETPOS, TRUE, m_settings.masterVolume);
+        }
+        if (!m_isCrossfading && (m_state == STATE_PLAYING || m_state == STATE_FADING_FROM_PAUSE)) {
+            DirectShowStream* active = GetActiveStream();
+            if (active && active->isInitialized) {
+                active->SetVolume(GetNormalizedMasterVolume());
+            }
+        }
+    }
+
+    bool SaveSettingsToFile() {
+        return WriteSettingsJson(SettingsFilePath(), m_settings);
+    }
+
+    // The layered popup is only the incoming fade surface on the first hop.
+    // Once that fade finishes, the popup IS the current picture and must stay
+    // visible. When a later fade puts the new clip on the base window, the
+    // popup has to get out of the way.
+    void EnsureActiveVideoVisible() {
+        if (!m_hWndVideoOverlay) return;
+        if (m_isStreamBActive) {
+            UpdateSyncOverlayPosition();
+            SetLayeredWindowAttributes(m_hWndVideoOverlay, 0, 255, LWA_ALPHA);
+            ShowWindow(m_hWndVideoOverlay, SW_SHOWNA);
+        } else {
+            SetLayeredWindowAttributes(m_hWndVideoOverlay, 0, 0, LWA_ALPHA);
+            ShowWindow(m_hWndVideoOverlay, SW_HIDE);
+        }
     }
 
     DirectShowStream* GetActiveStream() {
@@ -740,10 +924,13 @@ public:
         GetWindowRect(m_hWndVideoBase, &rcBase);
         // During fullscreen the video shell is topmost; the crossfade overlay has to
         // sit above it, and must drop back out of the topmost band afterwards.
+        // Stream B's picture lives on this popup. Keep it up while it is the
+        // current clip, not only while a fade is in progress.
+        bool showOverlay = m_isCrossfading || m_isStreamBActive;
         SetWindowPos(m_hWndVideoOverlay, m_isFullscreen ? HWND_TOPMOST : HWND_NOTOPMOST,
                      rcBase.left, rcBase.top,
                      rcBase.right - rcBase.left, rcBase.bottom - rcBase.top,
-                     SWP_NOACTIVATE | (m_isCrossfading ? SWP_SHOWWINDOW : 0));
+                     SWP_NOACTIVATE | (showOverlay ? SWP_SHOWWINDOW : 0));
 
         m_streamA.ResizeToWindow();
         m_streamB.ResizeToWindow();
@@ -989,9 +1176,11 @@ public:
     void PlayTrackIndex(int index) {
         if (index < 0 || index >= (int)m_playlistFiles.size()) return;
 
-        // Cancel any existing crossfade
+        // Drop a fade in progress without adopting its incoming surface.
+        // The requested track is loaded onto the stream that stays visible.
         if (m_isCrossfading) {
-            CompleteCrossfade();
+            m_isCrossfading = false;
+            GetIncomingStream()->Release();
         }
 
         m_currentTrackIndex = index;
@@ -1005,13 +1194,14 @@ public:
             pActive->Play();
             m_state = STATE_PLAYING;
             SetStatusText(L"Playing: " + std::wstring(PathFindFileName(m_playlistFiles[index].c_str())));
-            UpdateSyncOverlayPosition();
+            EnsureActiveVideoVisible();
         } else {
             wchar_t errBuf[160];
             swprintf(errBuf, 160, L"Error: Could not render media file (%08X).",
                      (unsigned)pActive->lastError);
             SetStatusText(errBuf);
             m_state = STATE_STOPPED;
+            EnsureActiveVideoVisible();
         }
     }
 
@@ -1050,14 +1240,21 @@ public:
 
     void StopPlayback() {
         if (m_isCrossfading) {
-            CompleteCrossfade();
+            if (m_currentTrackIndex + 1 < (int)m_playlistFiles.size()) {
+                m_currentTrackIndex++;
+                SendMessage(m_hPlaylist, LB_SETCURSEL, m_currentTrackIndex, 0);
+            }
+            m_isCrossfading = false;
         }
-        m_streamA.Stop();
-        m_streamB.Stop();
+        // Release (not Stop) so a seek-to-zero cannot repaint the clip we just cleared.
         m_streamA.Release();
         m_streamB.Release();
+        m_isStreamBActive = false;
         m_state = STATE_STOPPED;
-        ShowWindow(m_hWndVideoOverlay, SW_HIDE);
+        if (m_hWndVideoOverlay) {
+            SetLayeredWindowAttributes(m_hWndVideoOverlay, 0, 0, LWA_ALPHA);
+            ShowWindow(m_hWndVideoOverlay, SW_HIDE);
+        }
         SetStatusText(L"Stopped.");
         SetWindowText(m_hTxtTime, L"00:00 / 00:00");
         SendMessage(m_hSeekBar, TBM_SETPOS, TRUE, 0);
@@ -1096,11 +1293,15 @@ public:
             // Prepare initial crossfade state
             pIncoming->SetVolume(0.0);
             pIncoming->Play();
+            pIncoming->RefreshVideo();
 
-            // Overlay display preparation
+            // Overlay display preparation. Fade the popup in when it holds the
+            // incoming clip. When the incoming clip is on the base window, the
+            // popup is the outgoing clip and must start fully opaque.
             UpdateSyncOverlayPosition();
             ShowWindow(m_hWndVideoOverlay, SW_SHOWNA);
-            SetLayeredWindowAttributes(m_hWndVideoOverlay, 0, 0, LWA_ALPHA);
+            bool incomingOnOverlay = (hTargetWnd == m_hWndVideoOverlay);
+            SetLayeredWindowAttributes(m_hWndVideoOverlay, 0, incomingOnOverlay ? 0 : 255, LWA_ALPHA);
 
             SetStatusText(L"Crossfading into: " + std::wstring(PathFindFileName(m_playlistFiles[nextIndex].c_str())));
         }
@@ -1113,19 +1314,44 @@ public:
         DirectShowStream* pOutgoing = GetActiveStream();
         DirectShowStream* pIncoming = GetIncomingStream();
 
-        pOutgoing->Stop();
-        pOutgoing->Release();
+        bool incomingOnOverlay = pIncoming->hContainerWnd == m_hWndVideoOverlay;
 
-        // Swap roles
+        // Keep the faded-in frame on screen while the outgoing decoder is torn down.
+        // Releasing the outgoing stream also clears the last frame it left behind.
+        // When that outgoing surface is the popup, hide it first so the clear
+        // cannot paint black over the incoming clip on the base window.
+        if (incomingOnOverlay && m_hWndVideoOverlay) {
+            SetLayeredWindowAttributes(m_hWndVideoOverlay, 0, 255, LWA_ALPHA);
+            ShowWindow(m_hWndVideoOverlay, SW_SHOWNA);
+            pOutgoing->Release();
+        } else {
+            if (m_hWndVideoOverlay) {
+                SetLayeredWindowAttributes(m_hWndVideoOverlay, 0, 0, LWA_ALPHA);
+                ShowWindow(m_hWndVideoOverlay, SW_HIDE);
+            }
+            pOutgoing->Release();
+        }
+
+        // The window each stream was created against does not move, so the
+        // visible surface has to follow the stream that just became current.
         m_isStreamBActive = !m_isStreamBActive;
-        m_currentTrackIndex++;
+
+        if (m_currentTrackIndex + 1 < (int)m_playlistFiles.size()) {
+            m_currentTrackIndex++;
+        }
         SendMessage(m_hPlaylist, LB_SETCURSEL, m_currentTrackIndex, 0);
 
-        // Normalize final volumes
-        pIncoming->SetVolume(GetNormalizedMasterVolume());
+        // Normalize final volumes and repaint into the child host.
+        if (pIncoming->isInitialized) {
+            pIncoming->SetVolume(GetNormalizedMasterVolume());
+            pIncoming->ResizeToWindow();
+            pIncoming->RefreshVideo();
+        }
 
-        ShowWindow(m_hWndVideoOverlay, SW_HIDE);
-        SetStatusText(L"Playing: " + std::wstring(PathFindFileName(m_playlistFiles[m_currentTrackIndex].c_str())));
+        EnsureActiveVideoVisible();
+        if (m_currentTrackIndex >= 0 && m_currentTrackIndex < (int)m_playlistFiles.size()) {
+            SetStatusText(L"Playing: " + std::wstring(PathFindFileName(m_playlistFiles[m_currentTrackIndex].c_str())));
+        }
     }
 
     void OnTimerTick(double deltaTime) {
@@ -1197,10 +1423,16 @@ public:
             if (progress >= 1.0) {
                 CompleteCrossfade();
             } else {
-                // Smooth cosine / linear blending
+                // Smooth cosine / linear blending.
+                // The popup fades in when it is the incoming clip, and fades out
+                // when the incoming clip is already on the base window underneath.
                 double blend = progress;
-                BYTE overlayAlpha = (BYTE)(blend * 255.0);
-                SetLayeredWindowAttributes(m_hWndVideoOverlay, 0, overlayAlpha, LWA_ALPHA);
+                bool incomingOnOverlay = (GetIncomingVideoHWND() == m_hWndVideoOverlay);
+                double overlayOpacity = incomingOnOverlay ? blend : (1.0 - blend);
+                int alphaInt = (int)(overlayOpacity * 255.0 + 0.5);
+                if (alphaInt < 0) alphaInt = 0;
+                if (alphaInt > 255) alphaInt = 255;
+                SetLayeredWindowAttributes(m_hWndVideoOverlay, 0, (BYTE)alphaInt, LWA_ALPHA);
 
                 // Crossfade Audio levels
                 DirectShowStream* pOutgoing = GetActiveStream();
@@ -1210,6 +1442,17 @@ public:
                 pOutgoing->SetVolume((1.0 - blend) * master);
                 pIncoming->SetVolume(blend * master);
             }
+        }
+
+        // A layered window only recomposites when its attributes change. While
+        // stream B is the settled clip, keep nudging the popup so UpdateVideo
+        // stays on screen instead of freezing on one blit.
+        if (m_isStreamBActive && !m_isCrossfading && m_hWndVideoOverlay) {
+            if (!IsWindowVisible(m_hWndVideoOverlay)) {
+                ShowWindow(m_hWndVideoOverlay, SW_SHOWNA);
+            }
+            InvalidateRect(m_hWndVideoOverlay, NULL, FALSE);
+            SetLayeredWindowAttributes(m_hWndVideoOverlay, 0, 255, LWA_ALPHA);
         }
     }
 };
@@ -1318,37 +1561,68 @@ static LRESULT CALLBACK VideoHostProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM
     return DefWindowProc(hWnd, msg, wParam, lParam);
 }
 
-INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam) {
-    switch (msg) {
-    case WM_INITDIALOG: {
-        wchar_t buf[32];
-        swprintf(buf, 32, L"%.1f", g_pApp->m_settings.crossfadeDuration);
-        SetDlgItemText(hDlg, IDC_EDIT_CROSSFADE, buf);
-        swprintf(buf, 32, L"%.1f", g_pApp->m_settings.pauseFadeDuration);
-        SetDlgItemText(hDlg, IDC_EDIT_FADEPAUSE, buf);
-        return TRUE;
+static WNDPROC g_prevSettingsWndProc = NULL;
+static bool g_settingsFinished = false;
+static int g_settingsResult = IDCANCEL;
+static PlayerSettings g_settingsSnapshot;
+
+static void CommitSettingsFromDialog(HWND hDlg) {
+    if (!g_pApp) return;
+    wchar_t buf1[64] = { 0 };
+    wchar_t buf2[64] = { 0 };
+    GetDlgItemText(hDlg, IDC_EDIT_CROSSFADE, buf1, 64);
+    GetDlgItemText(hDlg, IDC_EDIT_FADEPAUSE, buf2, 64);
+
+    double cf = _wtof(buf1);
+    double fp = _wtof(buf2);
+    if (cf >= 0.5 && cf <= 30.0) g_pApp->m_settings.crossfadeDuration = cf;
+    if (fp >= 0.1 && fp <= 10.0) g_pApp->m_settings.pauseFadeDuration = fp;
+
+    if (g_pApp->SaveSettingsToFile()) {
+        g_pApp->SetStatusText(L"Settings saved.");
+    } else {
+        g_pApp->SetStatusText(L"Settings applied, but could not write settings.json.");
     }
-    case WM_COMMAND:
-        if (LOWORD(wParam) == IDOK) {
-            wchar_t buf1[32], buf2[32];
-            GetDlgItemText(hDlg, IDC_EDIT_CROSSFADE, buf1, 32);
-            GetDlgItemText(hDlg, IDC_EDIT_FADEPAUSE, buf2, 32);
+    g_pApp->ApplySettingsToControls();
+}
 
-            double cf = _wtof(buf1);
-            double fp = _wtof(buf2);
+static void CancelSettingsDialog() {
+    if (!g_pApp) return;
+    PlayerSettings saved;
+    if (ReadSettingsJson(SettingsFilePath(), &saved)) {
+        g_pApp->m_settings = saved;
+    } else {
+        g_pApp->m_settings = g_settingsSnapshot;
+    }
+    g_pApp->ApplySettingsToControls();
+    g_pApp->SetStatusText(L"Settings canceled.");
+}
 
-            if (cf >= 0.5 && cf <= 20.0) g_pApp->m_settings.crossfadeDuration = cf;
-            if (fp >= 0.1 && fp <= 10.0) g_pApp->m_settings.pauseFadeDuration = fp;
-
-            EndDialog(hDlg, IDOK);
-            return TRUE;
-        } else if (LOWORD(wParam) == IDCANCEL) {
-            EndDialog(hDlg, IDCANCEL);
-            return TRUE;
+static LRESULT CALLBACK SettingsWndProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == WM_COMMAND) {
+        int id = LOWORD(wParam);
+        if (id == IDOK) {
+            CommitSettingsFromDialog(hDlg);
+            g_settingsResult = IDOK;
+            g_settingsFinished = true;
+            return 0;
         }
-        break;
+        if (id == IDCANCEL) {
+            CancelSettingsDialog();
+            g_settingsResult = IDCANCEL;
+            g_settingsFinished = true;
+            return 0;
+        }
+    } else if (msg == WM_CLOSE) {
+        CancelSettingsDialog();
+        g_settingsResult = IDCANCEL;
+        g_settingsFinished = true;
+        return 0;
     }
-    return FALSE;
+    if (g_prevSettingsWndProc) {
+        return CallWindowProc(g_prevSettingsWndProc, hDlg, msg, wParam, lParam);
+    }
+    return DefWindowProc(hDlg, msg, wParam, lParam);
 }
 
 void ShowSettingsDialog(HWND hWndParent, HINSTANCE hInstance) {
@@ -1401,6 +1675,10 @@ void ShowSettingsDialog(HWND hWndParent, HINSTANCE hInstance) {
         return TRUE;
     }, (LPARAM)hFont);
 
+    g_settingsSnapshot = g_pApp->m_settings;
+    g_settingsFinished = false;
+    g_settingsResult = IDCANCEL;
+
     wchar_t b1[32], b2[32];
     swprintf(b1, 32, L"%.1f", g_pApp->m_settings.crossfadeDuration);
     swprintf(b2, 32, L"%.1f", g_pApp->m_settings.pauseFadeDuration);
@@ -1417,34 +1695,38 @@ void ShowSettingsDialog(HWND hWndParent, HINSTANCE hInstance) {
     int y = rcP.top + ((rcP.bottom - rcP.top) - dH) / 2;
     SetWindowPos(hDlg, NULL, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
 
+    // Button clicks are sent to the parent as WM_COMMAND during DispatchMessage.
+    // They never come back out of GetMessage, so the window proc has to handle them.
+    g_prevSettingsWndProc = (WNDPROC)SetWindowLongPtr(hDlg, GWLP_WNDPROC, (LONG_PTR)SettingsWndProc);
+
     EnableWindow(hWndParent, FALSE);
     ShowWindow(hDlg, SW_SHOW);
 
     MSG msg;
-    BOOL bRunning = TRUE;
-    while (bRunning && GetMessage(&msg, NULL, 0, 0)) {
-        if (msg.message == WM_COMMAND) {
-            if (LOWORD(msg.wParam) == IDOK) {
-                GetWindowText(hEd1, b1, 32);
-                GetWindowText(hEd2, b2, 32);
-                double cf = _wtof(b1);
-                double fp = _wtof(b2);
-                if (cf >= 0.5 && cf <= 30.0) g_pApp->m_settings.crossfadeDuration = cf;
-                if (fp >= 0.1 && fp <= 10.0) g_pApp->m_settings.pauseFadeDuration = fp;
-                bRunning = FALSE;
-            } else if (LOWORD(msg.wParam) == IDCANCEL) {
-                bRunning = FALSE;
+    while (GetMessage(&msg, NULL, 0, 0)) {
+        if (msg.message == WM_QUIT) {
+            PostQuitMessage((int)msg.wParam);
+            break;
+        }
+        if (msg.message == WM_KEYDOWN && (msg.wParam == VK_RETURN || msg.wParam == VK_ESCAPE)) {
+            HWND focus = GetFocus();
+            if (focus == hDlg || IsChild(hDlg, focus)) {
+                SendMessage(hDlg, WM_COMMAND, msg.wParam == VK_RETURN ? IDOK : IDCANCEL, 0);
+                if (g_settingsFinished) break;
+                continue;
             }
         }
         if (!IsDialogMessage(hDlg, &msg)) {
             TranslateMessage(&msg);
             DispatchMessage(&msg);
         }
+        if (g_settingsFinished) break;
     }
 
     EnableWindow(hWndParent, TRUE);
     DestroyWindow(hDlg);
     SetActiveWindow(hWndParent);
+    (void)g_settingsResult;
 }
 
 LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -1459,6 +1741,18 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) 
     case WM_MOVE:
         if (g_pApp) g_pApp->UpdateSyncOverlayPosition();
         return 0;
+
+    case WM_SHOWWINDOW:
+        // The crossfade surface is an owned popup. Hide it with the main window
+        // so a minimized player does not leave a stray video floating.
+        if (g_pApp && g_pApp->m_hWndVideoOverlay) {
+            if (!wParam) {
+                ShowWindow(g_pApp->m_hWndVideoOverlay, SW_HIDE);
+            } else {
+                g_pApp->UpdateSyncOverlayPosition();
+            }
+        }
+        break;
 
     case WM_DROPFILES:
         if (g_pApp) g_pApp->HandleDropFiles((HDROP)wParam);
