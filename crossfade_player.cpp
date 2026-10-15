@@ -23,7 +23,9 @@
   - Configurable crossfade time and pause/resume fade duration via Settings.
   - Drag-and-drop playlist management (reordering, removal, clearing).
   - Open and Save M3U playlists. Optional file paths on the command line.
-  - Full keyboard shortcuts: Spacebar to toggle Play/Pause, Esc, etc.
+  - Fullscreen the video display only (not the rest of the window): Fullscreen button,
+    double-click the video, Esc to leave.
+  - Keyboard: Spacebar toggles Play/Pause. Esc leaves fullscreen.
   - Win32 UI compatible across WinXP x64, Vista, 7, 8, 8.1, 10, and 11.
 
   Compilation (MinGW-w64):
@@ -95,6 +97,7 @@
 #define IDC_BTN_SETTINGS      2014
 #define IDC_TXT_STATUS        2015
 #define IDC_TXT_TIME          2016
+#define IDC_BTN_FULLSCREEN    2017
 
 #define IDC_EDIT_CROSSFADE    3001
 #define IDC_EDIT_FADEPAUSE    3002
@@ -361,7 +364,9 @@ public:
                 hasVideo = true;
                 pVideo->put_Owner((OAHWND)hContainerWnd);
                 pVideo->put_WindowStyle(WS_CHILD | WS_CLIPSIBLINGS | WS_CLIPCHILDREN);
-                pVideo->put_MessageDrain((OAHWND)notifyWnd);
+                // Mouse input on the renderer belongs to the video surface so a
+                // double-click there can toggle fullscreen.
+                pVideo->put_MessageDrain((OAHWND)hContainerWnd);
                 ResizeToWindow();
                 pVideo->put_Visible(OATRUE);
             }
@@ -513,6 +518,7 @@ public:
     HWND m_hWndMain;
     HWND m_hWndVideoBase;
     HWND m_hWndVideoOverlay;
+    HWND m_hWndFullscreen;
 
     // UI Controls
     HWND m_hBtnPlay;
@@ -520,8 +526,10 @@ public:
     HWND m_hBtnStop;
     HWND m_hBtnPrev;
     HWND m_hBtnNext;
+    HWND m_hBtnFull;
     HWND m_hSeekBar;
     HWND m_hVolBar;
+    HWND m_hLblVol;
     HWND m_hPlaylist;
     HWND m_hBtnAdd;
     HWND m_hBtnRemove;
@@ -550,16 +558,19 @@ public:
     bool          m_isCrossfading;
     double        m_crossfadeTimer;
     bool          m_userIsDraggingSeek;
+    bool          m_isFullscreen;
 
     VideoPlayerApp()
         : m_hWndMain(NULL), m_hWndVideoBase(NULL), m_hWndVideoOverlay(NULL),
+          m_hWndFullscreen(NULL),
           m_hBtnPlay(NULL), m_hBtnPause(NULL), m_hBtnStop(NULL), m_hBtnPrev(NULL),
-          m_hBtnNext(NULL), m_hSeekBar(NULL), m_hVolBar(NULL), m_hPlaylist(NULL),
+          m_hBtnNext(NULL), m_hBtnFull(NULL), m_hSeekBar(NULL), m_hVolBar(NULL),
+          m_hLblVol(NULL), m_hPlaylist(NULL),
           m_hBtnAdd(NULL), m_hBtnRemove(NULL), m_hBtnClear(NULL), m_hBtnOpenPL(NULL),
           m_hBtnSavePL(NULL), m_hBtnSettings(NULL), m_hTxtStatus(NULL), m_hTxtTime(NULL),
           m_isStreamBActive(false), m_currentTrackIndex(-1), m_state(STATE_STOPPED),
           m_fadeTimerSeconds(0.0), m_isCrossfading(false), m_crossfadeTimer(0.0),
-          m_userIsDraggingSeek(false)
+          m_userIsDraggingSeek(false), m_isFullscreen(false)
     {
         m_settings.crossfadeDuration = 3.0; // Default 3s crossfade
         m_settings.pauseFadeDuration = 1.5; // Default 1.5s audio fade on pause/play
@@ -587,8 +598,10 @@ public:
 
         // Dedicated viewport. A STATIC black rect paints over Media Foundation video.
         WNDCLASS wcHost = { 0 };
+        wcHost.style = CS_DBLCLKS;
         wcHost.lpfnWndProc = VideoHostProc;
         wcHost.hInstance = hInstance;
+        wcHost.hCursor = LoadCursor(NULL, IDC_ARROW);
         wcHost.lpszClassName = L"CrossfadeVideoHost";
         wcHost.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
         RegisterClass(&wcHost);
@@ -602,8 +615,10 @@ public:
 
         // Overlay window for crossfading. Uses WS_POPUP and WS_EX_LAYERED for XP+ crossfade support.
         WNDCLASS wcOverlay = { 0 };
-        wcOverlay.lpfnWndProc = DefWindowProc;
+        wcOverlay.style = CS_DBLCLKS;
+        wcOverlay.lpfnWndProc = VideoHostProc;
         wcOverlay.hInstance = hInstance;
+        wcOverlay.hCursor = LoadCursor(NULL, IDC_ARROW);
         wcOverlay.lpszClassName = L"CrossfadeOverlayClass";
         wcOverlay.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
         RegisterClass(&wcOverlay);
@@ -659,14 +674,17 @@ public:
         m_hBtnNext = CreateWindow(L"BUTTON", L"Next >>|", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
             330, 430, 75, 30, hWndParent, (HMENU)IDC_BTN_NEXT, hInstance, NULL);
 
+        m_hBtnFull = CreateWindow(L"BUTTON", L"Fullscreen", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            410, 430, 92, 30, hWndParent, (HMENU)IDC_BTN_FULLSCREEN, hInstance, NULL);
+
         // Volume Bar
-        HWND hLblVol = CreateWindow(L"STATIC", L"Volume:", WS_CHILD | WS_VISIBLE,
-            420, 435, 55, 20, hWndParent, NULL, hInstance, NULL);
+        m_hLblVol = CreateWindow(L"STATIC", L"Volume:", WS_CHILD | WS_VISIBLE,
+            508, 435, 52, 20, hWndParent, NULL, hInstance, NULL);
 
         m_hVolBar = CreateWindowEx(
             0, TRACKBAR_CLASS, L"",
             WS_CHILD | WS_VISIBLE | TBS_NOTICKS,
-            480, 430, 170, 30,
+            562, 430, 88, 30,
             hWndParent, (HMENU)IDC_VOLBAR, hInstance, NULL
         );
         SendMessage(m_hVolBar, TBM_SETRANGE, TRUE, MAKELPARAM(0, 100));
@@ -720,7 +738,9 @@ public:
         if (!m_hWndVideoBase || !m_hWndVideoOverlay) return;
         RECT rcBase;
         GetWindowRect(m_hWndVideoBase, &rcBase);
-        SetWindowPos(m_hWndVideoOverlay, HWND_TOP,
+        // During fullscreen the video shell is topmost; the crossfade overlay has to
+        // sit above it, and must drop back out of the topmost band afterwards.
+        SetWindowPos(m_hWndVideoOverlay, m_isFullscreen ? HWND_TOPMOST : HWND_NOTOPMOST,
                      rcBase.left, rcBase.top,
                      rcBase.right - rcBase.left, rcBase.bottom - rcBase.top,
                      SWP_NOACTIVATE | (m_isCrossfading ? SWP_SHOWWINDOW : 0));
@@ -743,8 +763,10 @@ public:
         if (videoW < 200) videoW = 200;
         if (videoH < 150) videoH = 150;
 
-        // Position video display
-        MoveWindow(m_hWndVideoBase, 10, 10, videoW, videoH, TRUE);
+        // While fullscreen the video host is a child of the monitor-sized shell.
+        if (!m_isFullscreen) {
+            MoveWindow(m_hWndVideoBase, 10, 10, videoW, videoH, TRUE);
+        }
 
         // Position seekbar and time labels
         int seekY = videoH + 15;
@@ -760,8 +782,16 @@ public:
         MoveWindow(m_hBtnStop, 235, btnY, 70, 30, TRUE);
         MoveWindow(m_hBtnNext, 310, btnY, 70, 30, TRUE);
 
-        // Volume
-        MoveWindow(m_hVolBar, 390, btnY, videoW - 390, 30, TRUE);
+        int fullW = 92;
+        int fullX = 385;
+        MoveWindow(m_hBtnFull, fullX, btnY, fullW, 30, TRUE);
+        int labelW = 52;
+        int labelX = fullX + fullW + 6;
+        if (m_hLblVol) MoveWindow(m_hLblVol, labelX, btnY + 6, labelW, 18, TRUE);
+        int volX = labelX + labelW + 2;
+        int volW = videoW - volX;
+        if (volW < 40) volW = 40;
+        MoveWindow(m_hVolBar, volX, btnY, volW, 30, TRUE);
 
         // Playlist section
         int plX = videoW + 20;
@@ -776,6 +806,84 @@ public:
         MoveWindow(m_hBtnSettings, plX, plBtnY + 32, plWidth, 26, TRUE);
 
         UpdateSyncOverlayPosition();
+    }
+
+    void UpdateFullscreenButton() {
+        if (!m_hBtnFull) return;
+        SetWindowText(m_hBtnFull, m_isFullscreen ? L"Exit Full" : L"Fullscreen");
+    }
+
+    bool MonitorRectForVideo(RECT* outRect) {
+        if (!outRect || !m_hWndVideoBase) return false;
+        HMONITOR monitor = MonitorFromWindow(m_hWndVideoBase, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO info;
+        info.cbSize = sizeof(info);
+        if (GetMonitorInfo(monitor, &info)) {
+            *outRect = info.rcMonitor;
+            return true;
+        }
+        outRect->left = 0;
+        outRect->top = 0;
+        outRect->right = GetSystemMetrics(SM_CXSCREEN);
+        outRect->bottom = GetSystemMetrics(SM_CYSCREEN);
+        return true;
+    }
+
+    void EnterFullscreen() {
+        if (m_isFullscreen || !m_hWndVideoBase || !m_hWndMain) return;
+
+        RECT rc;
+        if (!MonitorRectForVideo(&rc)) return;
+        int width = rc.right - rc.left;
+        int height = rc.bottom - rc.top;
+        if (width < 1 || height < 1) return;
+
+        HINSTANCE inst = (HINSTANCE)GetWindowLongPtr(m_hWndMain, GWLP_HINSTANCE);
+        HWND shell = CreateWindowEx(
+            WS_EX_TOPMOST,
+            L"CrossfadeVideoHost",
+            L"",
+            WS_POPUP | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
+            rc.left, rc.top, width, height,
+            m_hWndMain, NULL, inst, NULL
+        );
+        if (!shell) return;
+
+        m_hWndFullscreen = shell;
+        m_isFullscreen = true;
+        SetParent(m_hWndVideoBase, shell);
+        MoveWindow(m_hWndVideoBase, 0, 0, width, height, TRUE);
+        ShowWindow(shell, SW_SHOW);
+        UpdateFullscreenButton();
+        UpdateSyncOverlayPosition();
+        SetForegroundWindow(shell);
+        SetFocus(m_hWndVideoBase);
+    }
+
+    void ExitFullscreen() {
+        if (!m_isFullscreen) return;
+        m_isFullscreen = false;
+
+        if (m_hWndVideoBase && m_hWndMain) {
+            ShowWindow(m_hWndVideoBase, SW_HIDE);
+            SetParent(m_hWndVideoBase, m_hWndMain);
+        }
+        if (m_hWndFullscreen && GetParent(m_hWndVideoBase) == m_hWndMain) {
+            HWND shell = m_hWndFullscreen;
+            m_hWndFullscreen = NULL;
+            DestroyWindow(shell);
+        }
+        UpdateFullscreenButton();
+        if (m_hWndMain) {
+            OnResize();
+            ShowWindow(m_hWndVideoBase, SW_SHOW);
+            SetForegroundWindow(m_hWndMain);
+        }
+    }
+
+    void ToggleFullscreen() {
+        if (m_isFullscreen) ExitFullscreen();
+        else EnterFullscreen();
     }
 
     void AddFileToPlaylist(const std::wstring& path) {
@@ -1108,17 +1216,95 @@ public:
 
 static VideoPlayerApp* g_pApp = NULL;
 
+// DirectShow's video window often lacks CS_DBLCLKS, so a second click arrives as
+// WM_LBUTTONDOWN instead of WM_LBUTTONDBLCLK. Track that case with the system
+// double-click interval. Windows that do send DBLCLK are handled separately.
+struct VideoDoubleClickTracker {
+    HWND hwnd;
+    DWORD time;
+    int x;
+    int y;
+
+    VideoDoubleClickTracker() : hwnd(NULL), time(0), x(0), y(0) {}
+
+    void Reset() {
+        hwnd = NULL;
+        time = 0;
+    }
+
+    bool OnButtonDown(HWND target, LPARAM lParam) {
+        int cx = (int)(short)LOWORD(lParam);
+        int cy = (int)(short)HIWORD(lParam);
+        DWORD now = (DWORD)GetMessageTime();
+        int slopX = GetSystemMetrics(SM_CXDOUBLECLK);
+        int slopY = GetSystemMetrics(SM_CYDOUBLECLK);
+        if (slopX < 1) slopX = 1;
+        if (slopY < 1) slopY = 1;
+        int dx = cx - x;
+        int dy = cy - y;
+        if (dx < 0) dx = -dx;
+        if (dy < 0) dy = -dy;
+        bool match = hwnd == target
+            && (now - time) <= (DWORD)GetDoubleClickTime()
+            && dx <= slopX
+            && dy <= slopY;
+        if (match) {
+            Reset();
+            return true;
+        }
+        hwnd = target;
+        time = now;
+        x = cx;
+        y = cy;
+        return false;
+    }
+};
+
+static VideoDoubleClickTracker g_videoDblClick;
+
 static LRESULT CALLBACK VideoHostProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_ERASEBKGND:
         return 1;
+    case WM_CLOSE:
+        // The fullscreen shell and the video host are not the app window.
+        // Alt+F4 on the shell leaves fullscreen instead of destroying playback.
+        if (g_pApp && hWnd == g_pApp->m_hWndFullscreen) {
+            g_pApp->ExitFullscreen();
+        }
+        return 0;
+    case WM_SIZE:
+        if (g_pApp && hWnd == g_pApp->m_hWndFullscreen && g_pApp->m_hWndVideoBase) {
+            int width = LOWORD(lParam);
+            int height = HIWORD(lParam);
+            MoveWindow(g_pApp->m_hWndVideoBase, 0, 0, width, height, TRUE);
+            g_pApp->UpdateSyncOverlayPosition();
+        } else if (g_pApp && (hWnd == g_pApp->m_hWndVideoBase || hWnd == g_pApp->m_hWndVideoOverlay)) {
+            g_pApp->m_streamA.ResizeToWindow();
+            g_pApp->m_streamB.ResizeToWindow();
+        }
+        return 0;
+    case WM_LBUTTONDBLCLK:
+        g_videoDblClick.Reset();
+        if (g_pApp && (hWnd == g_pApp->m_hWndVideoBase || hWnd == g_pApp->m_hWndVideoOverlay
+                       || hWnd == g_pApp->m_hWndFullscreen)) {
+            g_pApp->ToggleFullscreen();
+        }
+        return 0;
+    case WM_LBUTTONDOWN:
+        if (g_pApp && (hWnd == g_pApp->m_hWndVideoBase || hWnd == g_pApp->m_hWndVideoOverlay)
+            && g_videoDblClick.OnButtonDown(hWnd, lParam)) {
+            g_pApp->ToggleFullscreen();
+            return 0;
+        }
+        break;
     case WM_PAINT: {
         PAINTSTRUCT ps;
         BeginPaint(hWnd, &ps);
         EndPaint(hWnd, &ps);
         // UpdateVideo can itself generate WM_PAINT. Guard against re-entry.
         static int refreshing = 0;
-        if (g_pApp && !refreshing) {
+        if (g_pApp && !refreshing && hWnd != g_pApp->m_hWndFullscreen) {
             refreshing++;
             g_pApp->m_streamA.RefreshVideo();
             g_pApp->m_streamB.RefreshVideo();
@@ -1330,6 +1516,9 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         case IDC_BTN_NEXT:
             g_pApp->NextTrack();
             break;
+        case IDC_BTN_FULLSCREEN:
+            g_pApp->ToggleFullscreen();
+            break;
         case IDC_BTN_ADD: {
             wchar_t szFile[MAX_PATH] = { 0 };
             OPENFILENAME ofn = { 0 };
@@ -1400,6 +1589,11 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         }
         return 0;
     }
+
+    case WM_CLOSE:
+        if (g_pApp) g_pApp->ExitFullscreen();
+        DestroyWindow(hWnd);
+        return 0;
 
     case WM_DESTROY:
         PostQuitMessage(0);
@@ -1479,6 +1673,13 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
             lastTick = currentTick;
             if (deltaMs > 200) deltaMs = 200; // Cap large spikes
             g_pApp->OnTimerTick((double)deltaMs / 1000.0);
+        }
+
+        if (msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE) {
+            if (g_pApp && g_pApp->m_isFullscreen) {
+                g_pApp->ExitFullscreen();
+                continue;
+            }
         }
 
         // Intercept Spacebar globally when focus is on non-edit controls

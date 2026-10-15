@@ -22,6 +22,9 @@ x86_64-w64-mingw32-g++ -O2 -std=c++17 -municode -mwindows -static crossfade_play
 CrossFadePlayer.exe test-files\test1.mp4 test-files\test2.mp4
 ```
 
+The **Fullscreen** button maximises only the video display. Double-click the video to enter or leave fullscreen. Escape leaves fullscreen. The built player is `CrossFadePlayer.exe`.
+
+
 The dev environment includes a Windows 10 Pro guest for manual testing. It signs in automatically as `Tester` / `tester`. The desktop has `CrossFadePlayer.exe`, `test1.mp4`, and `test2.mp4`. Nested KVM faults on this host, so the guest runs under QEMU TCG:
 
 ```
